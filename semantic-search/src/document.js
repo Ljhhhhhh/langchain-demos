@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { OpenAIEmbeddings, ChatOpenAI } from '@langchain/openai';
+import { MemoryVectorStore } from 'langchain/vectorstores/memory';
 
 dotenv.config();
 
@@ -20,36 +21,42 @@ dotenv.config();
 // ];
 
 const embeddings = new OpenAIEmbeddings({
-  apiKey: process.env.SILICONFLOW_API_KEY,
-  apiBase: 'https://api.siliconflow.cn/v1',
-  basePath: '',
-  model: 'Pro/BAAI/bge-m3',
+  modelName: 'Pro/BAAI/bge-m3',
+  openAIApiKey: process.env.SILICONFLOW_API_KEY,
+  configuration: {
+    baseURL: 'https://api.siliconflow.cn/v1',
+  },
 });
 
-const assetsPath = path.join(process.cwd(), 'assets');
-const pdfPath = path.join(assetsPath, '00.pdf');
-const loader = new PDFLoader(pdfPath);
+async function embed(query) {
+  const assetsPath = path.join(process.cwd(), 'assets');
+  const pdfPath = path.join(assetsPath, '00.pdf');
+  const loader = new PDFLoader(pdfPath);
 
-const docs = await loader.load();
+  const docs = await loader.load();
 
-const textSplitter = new RecursiveCharacterTextSplitter({
-  chunkSize: 1000,
-  chunkOverlap: 200,
-});
+  const textSplitter = new RecursiveCharacterTextSplitter({
+    chunkSize: 1000,
+    chunkOverlap: 200,
+  });
 
-const allSplits = await textSplitter.splitDocuments(docs);
+  const allSplits = await textSplitter.splitDocuments(docs);
 
-try {
-  const res = await embeddings.embedQuery('Hello world');
-  console.log(res);
-} catch (error) {
-  console.log(error);
+  const vector1 = await embeddings.embedQuery(allSplits[0].pageContent);
+  const vector2 = await embeddings.embedQuery(allSplits[1].pageContent);
+
+  const vectorStore = new MemoryVectorStore(embeddings);
+  await vectorStore.addDocuments(allSplits);
+
+  const search = await vectorStore.similaritySearch('又剩下他孤苦伶仃一人');
+  console.log('search', search);
 }
-const vector1 = await embeddings.embedQuery(allSplits[0].pageContent);
-const vector2 = await embeddings.embedQuery(allSplits[1].pageContent);
 
-console.assert(vector1.length === vector2.length);
-console.log(`Generated vectors of length ${vector1.length}\n`);
-console.log(vector1.slice(0, 10));
-
-// https://blog.csdn.net/u012899618/article/details/145620482
+(async () => {
+  try {
+    await embed('Hello world');
+    console.log('程序执行完毕');
+  } catch (error) {
+    console.error('主程序错误:', error);
+  }
+})();
