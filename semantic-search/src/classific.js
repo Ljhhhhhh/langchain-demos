@@ -13,7 +13,7 @@ console.log(process.env.SILICONFLOW_API_KEY, 'process.env.SILICONFLOW_API_KEY');
 const llm = new ChatOpenAI({
   modelName: 'google/gemini-2.0-flash-001', // 'deepseek-ai/DeepSeek-V3',
   openAIApiKey:
-    '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', // process.env.SILICONFLOW_API_KEY,
+    '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', // process.env.SILICONFLOW_API_KEY,
   configuration: {
     baseURL: 'https://openrouter.ai/api/v1', // 'https://api.siliconflow.cn/v1',
   },
@@ -21,7 +21,7 @@ const llm = new ChatOpenAI({
 
 const classificationSchema = z.object({
   sentiment: z
-    .string()
+    .enum(['积极', '消极', '中性'])
     .describe('文本的情感，用中文表示，如积极、消极、中性等'),
   aggressiveness: z
     .number()
@@ -30,8 +30,8 @@ const classificationSchema = z.object({
     .max(10)
     .describe('文本的攻击性程度，范围从1到10。'),
   language: z
-    .string()
-    .describe('文本所使用的语种，用中文表示，如中文、英文、日文、韩文等'),
+    .enum(['中文', '英文', '日文', '韩文', '其他'])
+    .describe('文本所使用的语种'),
 });
 
 const llmWihStructuredOutput = llm.withStructuredOutput(classificationSchema, {
