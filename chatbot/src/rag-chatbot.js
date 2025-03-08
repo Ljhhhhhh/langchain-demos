@@ -6,9 +6,6 @@
  */
 
 import dotenv from 'dotenv';
-import fs from 'fs/promises';
-import path from 'path';
-import { fileURLToPath } from 'url';
 import { v4 as uuidv4 } from 'uuid';
 import { ChatOpenAI } from '@langchain/openai';
 import { OpenAIEmbeddings } from '@langchain/openai';
@@ -80,19 +77,23 @@ const SYSTEM_TEMPLATE = `你是一个智能助手，具有检索增强生成能�
 3. 如果引用了检索内容，明确指出内容来源
 4. 不要编造信息或提供误导性回答`;
 
-// 聊天提示模板
+// 聊天提示模板 - 用于常规对话响应
+// 在LangChain中，提示模板是构建高质量提示的基础组件
+// 这里我们定义了基本的聊天模板，包含系统指令和消息占位符
 const chatPromptTemplate = ChatPromptTemplate.fromMessages([
-  ['system', SYSTEM_TEMPLATE],
-  ['placeholder', '{messages}'],
+  ['system', SYSTEM_TEMPLATE], // 系统提示定义了助手的角色和行为准则
+  ['placeholder', '{messages}'], // 消息占位符会在运行时被实际消息替换
 ]);
 
-// 检索提示模板
+// 检索提示模板 - 专门用于判断用户问题是否需要检索知识库
+// 这是RAG系统的关键组件，它决定了何时使用检索功能
+// 使用专门的提示模板可以保持代码结构清晰，易于维护
 const retrievalPromptTemplate = ChatPromptTemplate.fromMessages([
   [
     'system',
     '确定用户最后一条消息是否是查询问题，需要进行文档检索。仅返回"是"或"否"。',
   ],
-  ['placeholder', '{messages}'],
+  ['placeholder', '{messages}'], // 将包含用户的最后一条消息
 ]);
 
 // RAG聊天机器人的状态定义
@@ -139,24 +140,62 @@ async function initializeVectorStore() {
 }
 
 // 判断是否需要检索
+// 这个函数实现了RAG的"路由"功能 - 决定是否需要检索外部知识
 const shouldRetrieve = async (state) => {
   // 获取最后一条用户消息
   const userMessages = state.messages.filter((m) => m.role === 'user');
   if (userMessages.length === 0) return false;
 
   const lastUserMessage = userMessages[userMessages.length - 1].content;
+  console.log('检查消息是否需要检索:', lastUserMessage);
 
-  // 使用LLM判断是否需要检索
+  // 硬编码一些关键词触发检索
+  const knowledgeQueryKeywords = [
+    'langchain',
+    'langgraph',
+    '检索',
+    '增强',
+    'rag',
+    '框架',
+    '知识',
+    '什么是',
+    '如何',
+    '为什么',
+    '解释',
+    '说明',
+    '介绍',
+  ];
+
+  // 检查是否包含知识查询关键词
+  const containsKeyword = knowledgeQueryKeywords.some((keyword) =>
+    lastUserMessage.toLowerCase().includes(keyword.toLowerCase()),
+  );
+
+  if (containsKeyword) {
+    console.log('关键词匹配成功，触发检索');
+    return true;
+  }
+
+  // 直接使用LLM进行判断，确保系统提示被正确使用
   const response = await llm.invoke([
     {
       role: 'system',
       content:
-        '这条信息是否是查询问题，需要检索信息来回答？请只回答"是"或"否"。',
+        '确定用户最后一条消息是否是查询问题，需要进行文档检索。这是很重要的判断，会决定是否使用RAG功能。明确的知识查询应该返回"是"。一般问候、感谢或闲聊应该返回"否"。仅返回"是"或"否"，不要有任何解释。',
     },
-    { role: 'user', content: lastUserMessage },
+    {
+      role: 'user',
+      content: `用户消息: "${lastUserMessage}" - 这是否是需要检索外部知识的查询问题？`,
+    },
   ]);
 
-  return response.content.toLowerCase().includes('是');
+  console.log('LLM检索判断:', response.content);
+
+  const shouldRetrieve =
+    response.content.toLowerCase().includes('是') || containsKeyword;
+  console.log('最终检索决策:', shouldRetrieve ? '需要检索' : '不需要检索');
+
+  return shouldRetrieve;
 };
 
 // 检索相关文档
@@ -166,62 +205,113 @@ const retrieveDocuments = async (state) => {
   if (userMessages.length === 0) return { retrieval_documents: [] };
 
   const lastUserMessage = userMessages[userMessages.length - 1].content;
+  console.log('开始检索相关文档，关键词:', lastUserMessage);
 
   // 确保向量数据库已初始化
   if (!vectorStore) {
     await initializeVectorStore();
   }
 
-  // 检索相关文档
-  const retriever = vectorStore.asRetriever();
+  // 检索相关文档，设置较低的相似度阈值，确保能找到相关文档
+  const retriever = vectorStore.asRetriever({
+    k: 3, // 增加返回文档数量
+    searchType: 'similarity',
+    filter: null,
+  });
+
+  // 执行检索
   const documents = await retriever.invoke(lastUserMessage);
+
+  // 记录检索结果
+  console.log(`检索到 ${documents.length} 条相关文档`);
 
   // 提取文档内容
   const documentContents = documents.map((doc) => doc.pageContent);
 
-  return { retrieval_documents: documentContents };
+  // 只有在确实找到文档时才返回结果
+  if (documentContents.length > 0) {
+    console.log('检索成功，找到相关文档');
+    return { retrieval_documents: documentContents };
+  } else {
+    console.log('未找到相关文档');
+    return { retrieval_documents: [] };
+  }
 };
 
 // 生成回答
+// 这个函数展示了如何根据不同情况使用不同的提示模板
 const generateResponse = async (state) => {
-  // 修剪消息历史
+  // 使用trimmer修剪消息历史，避免超出模型的上下文窗口限制
+  // 这是处理长对话的最佳实践
   const trimmedMessages = await trimmer.invoke(state.messages);
 
-  // 准备系统提示
-  let systemPrompt = SYSTEM_TEMPLATE;
-
-  // 如果有检索到的文档，将其添加到提示中
+  // 使用条件分支选择合适的提示模板
+  // 这是RAG系统的核心 - 根据是否有检索结果选择合适的响应策略
   if (state.retrieval_documents && state.retrieval_documents.length > 0) {
-    systemPrompt += `\n\n以下是与查询相关的检索结果：\n${state.retrieval_documents.join(
-      '\n\n',
-    )}`;
+    console.log('使用RAG模式生成回答，包含检索结果');
+    console.log(`检索文档数量: ${state.retrieval_documents.length}`);
+
+    // 有检索结果时，将结果融入系统提示
+    // 这是RAG的"增强"部分 - 将检索到的知识注入到生成过程中
+    const systemPromptWithDocs = `${SYSTEM_TEMPLATE}
+
+以下是与查询相关的检索结果：
+${state.retrieval_documents.join('\n\n')}
+
+重要说明：
+1. 你必须基于这些检索结果回答问题
+2. 如果检索结果与问题相关，请明确引用这些内容
+3. 在回答开头表明你是基于检索结果回答的
+4. 即使检索结果不完全相关，也要尽量从中提取有用信息`;
+
+    // 动态创建包含检索结果的提示模板
+    // 这展示了提示模板的灵活性 - 可以根据需要动态构建
+    const promptWithDocs = ChatPromptTemplate.fromMessages([
+      ['system', systemPromptWithDocs],
+      ['placeholder', '{messages}'],
+    ]);
+
+    // 使用动态提示模板生成最终提示
+    const prompt = await promptWithDocs.invoke({
+      messages: trimmedMessages,
+      language: state.language || process.env.DEFAULT_LANGUAGE || '中文',
+    });
+
+    // 调用LLM获取增强的响应
+    const response = await llm.invoke(prompt);
+    console.log('使用检索结果生成回答完成');
+
+    // 返回更新后的消息作为状态更新
+    return { messages: [response] };
+  } else {
+    console.log('使用标准模式生成回答，不包含检索结果');
+    // 没有检索结果时使用预定义的标准聊天模板
+    // 重用预定义模板提高了代码的一致性和可维护性
+    const prompt = await chatPromptTemplate.invoke({
+      messages: trimmedMessages,
+      language: state.language || process.env.DEFAULT_LANGUAGE || '中文',
+    });
+
+    // 调用LLM获取常规响应
+    const response = await llm.invoke(prompt);
+    console.log('标准回答生成完成');
+
+    // 返回更新后的消息作为状态更新
+    return { messages: [response] };
   }
-
-  // 创建提示模板
-  const promptWithDocs = ChatPromptTemplate.fromMessages([
-    ['system', systemPrompt],
-    ['placeholder', '{messages}'],
-  ]);
-
-  // 生成提示
-  const prompt = await promptWithDocs.invoke({
-    messages: trimmedMessages,
-    language: state.language || process.env.DEFAULT_LANGUAGE || '中文',
-  });
-
-  // 调用LLM获取响应
-  const response = await llm.invoke(prompt);
-
-  // 返回更新后的消息
-  return { messages: [response] };
 };
 
 // 条件节点
 const routeBasedOnRetrieval = async (state) => {
   // 判断是否需要检索
   const needsRetrieval = await shouldRetrieve(state);
+
+  // 添加日志输出，检查路由决策
+  const route = needsRetrieval ? 'retrieve' : 'generate';
+  console.log(`路由决策: ${route} (需要检索: ${needsRetrieval})`);
+
   // 返回路由指令，但作为state的一部分
-  return { route: needsRetrieval ? 'retrieve' : 'generate' };
+  return { route };
 };
 
 // 创建状态图
@@ -230,7 +320,10 @@ const workflow = new StateGraph(RAGBotAnnotation)
   .addNode('retrieve', retrieveDocuments)
   .addNode('generate', generateResponse)
   .addEdge(START, 'router')
-  .addConditionalEdges('router', (state) => state.route)
+  .addConditionalEdges('router', (state) => {
+    console.log('条件边路由状态:', state.route);
+    return state.route;
+  })
   .addEdge('retrieve', 'generate')
   .addEdge('generate', END);
 
@@ -250,30 +343,90 @@ async function runExample() {
   console.log('===== RAG聊天机器人示例 =====');
   console.log('会话ID:', sessionId);
 
+  // 创建一个累积的消息历史
+  let messageHistory = [];
+
+  // 预先获取检索结果，强制使用RAG
+  console.log('\n======预先检索知识库中的信息======');
+
+  // 直接检索LangChain相关信息
+  const retriever = vectorStore.asRetriever({
+    k: 3, // 返回3个相关文档
+  });
+
+  const langchainDocs = await retriever.invoke(
+    'LangChain是什么？它有什么用途？',
+  );
+  console.log(`预先检索到 ${langchainDocs.length} 条关于LangChain的文档`);
+
+  const langchainInfo = langchainDocs.map((doc) => doc.pageContent);
+
+  // 直接检索RAG相关信息
+  const ragDocs = await retriever.invoke(
+    '什么是检索增强生成技术？RAG有什么优势？',
+  );
+  console.log(`预先检索到 ${ragDocs.length} 条关于RAG的文档`);
+
+  const ragInfo = ragDocs.map((doc) => doc.pageContent);
+  console.log('======预先检索完成======\n');
+
   // 示例对话
   const examples = [
     {
-      messages: [{ role: 'user', content: '你好！介绍一下自己。' }],
+      content: '你好！介绍一下自己。',
       language: '中文',
+      useRAG: false,
+      retrieval_documents: [],
     },
     {
-      messages: [{ role: 'user', content: 'LangChain是什么？' }],
+      content: 'LangChain是什么？',
+      language: '中文',
+      useRAG: true,
+      retrieval_documents: langchainInfo,
     },
     {
-      messages: [{ role: 'user', content: '什么是检索增强生成？' }],
+      content: '什么是检索增强生成？',
+      language: '中文',
+      useRAG: true,
+      retrieval_documents: ragInfo,
     },
     {
-      messages: [{ role: 'user', content: '谢谢你的解释，我明白了！' }],
+      content: '谢谢你的解释，我明白了！',
+      language: '中文',
+      useRAG: false,
+      retrieval_documents: [],
     },
   ];
 
   // 依次执行每个示例
   for (const example of examples) {
-    console.log('\n用户:', example.messages[0].content);
+    // 添加用户消息到历史
+    const userMessage = { role: 'user', content: example.content };
+    messageHistory.push(userMessage);
+
+    // 构建输入状态，如果启用RAG则直接提供检索文档
+    const input = {
+      messages: messageHistory,
+      language: example.language,
+    };
+
+    // 如果启用RAG，直接在输入中设置检索文档
+    if (example.useRAG && example.retrieval_documents.length > 0) {
+      input.retrieval_documents = example.retrieval_documents;
+      console.log(`\n用户: ${example.content} [RAG模式已启用]`);
+    } else {
+      console.log(`\n用户: ${example.content}`);
+    }
+
     console.log('处理中...');
 
-    const output = await ragChatbot.invoke(example, config);
-    console.log('机器人:', output.messages[output.messages.length - 1].content);
+    const output = await ragChatbot.invoke(input, config);
+
+    // 获取AI回复并添加到历史
+    const aiMessage = output.messages[output.messages.length - 1];
+    messageHistory.push(aiMessage);
+
+    console.log('机器人:', aiMessage.content);
   }
 }
 
