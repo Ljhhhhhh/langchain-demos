@@ -11,6 +11,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import { v4 as uuidv4 } from 'uuid';
 import { ChatOpenAI } from '@langchain/openai';
+import { OpenAIEmbeddings } from '@langchain/openai';
 import { ChatPromptTemplate } from '@langchain/core/prompts';
 import {
   trimMessages,
@@ -25,15 +26,10 @@ import {
   MemorySaver,
   MessagesAnnotation,
   Annotation,
-  RunnableBranch,
 } from '@langchain/langgraph';
 import { MemoryVectorStore } from 'langchain/vectorstores/memory';
 import { RecursiveCharacterTextSplitter } from '@langchain/textsplitters';
 import { StringOutputParser } from '@langchain/core/output_parsers';
-
-// 获取当前文件的目录路径
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
 
 // 加载环境变量
 dotenv.config();
@@ -44,6 +40,15 @@ const llm = new ChatOpenAI({
   openAIApiKey: process.env.OPENROUTER_API_KEY,
   configuration: {
     baseURL: 'https://openrouter.ai/api/v1',
+  },
+});
+
+// 初始化嵌入模型
+const embeddings = new OpenAIEmbeddings({
+  modelName: 'Pro/BAAI/bge-m3',
+  openAIApiKey: process.env.SILICONFLOW_API_KEY,
+  configuration: {
+    baseURL: 'https://api.siliconflow.cn/v1',
   },
 });
 
@@ -93,8 +98,9 @@ const retrievalPromptTemplate = ChatPromptTemplate.fromMessages([
 // RAG聊天机器人的状态定义
 const RAGBotAnnotation = Annotation.Root({
   ...MessagesAnnotation.spec,
-  language: Annotation.of.string(),
-  retrieval_documents: Annotation.of.array().of(Annotation.of.string()),
+  language: Annotation(),
+  retrieval_documents: Annotation(),
+  route: Annotation(),
 });
 
 // 初始化向量数据库
@@ -120,7 +126,10 @@ async function initializeVectorStore() {
     const splitDocuments = await textSplitter.createDocuments(documents);
 
     // 创建向量存储
-    vectorStore = await MemoryVectorStore.fromDocuments(splitDocuments, llm);
+    vectorStore = await MemoryVectorStore.fromDocuments(
+      splitDocuments,
+      embeddings,
+    );
 
     console.log('向量数据库初始化成功，已添加', documents.length, '条文档');
   } catch (error) {
@@ -138,27 +147,16 @@ const shouldRetrieve = async (state) => {
   const lastUserMessage = userMessages[userMessages.length - 1].content;
 
   // 使用LLM判断是否需要检索
-  const retrieval = RunnableBranch.from([
+  const response = await llm.invoke([
     {
-      condition: async () => {
-        const response = await llm.invoke([
-          {
-            role: 'system',
-            content:
-              '这条信息是否是查询问题，需要检索信息来回答？请只回答"是"或"否"。',
-          },
-          { role: 'user', content: lastUserMessage },
-        ]);
-        return response.content.toLowerCase().includes('是');
-      },
-      value: true,
+      role: 'system',
+      content:
+        '这条信息是否是查询问题，需要检索信息来回答？请只回答"是"或"否"。',
     },
-    {
-      value: false,
-    },
+    { role: 'user', content: lastUserMessage },
   ]);
 
-  return retrieval.invoke();
+  return response.content.toLowerCase().includes('是');
 };
 
 // 检索相关文档
@@ -222,11 +220,8 @@ const generateResponse = async (state) => {
 const routeBasedOnRetrieval = async (state) => {
   // 判断是否需要检索
   const needsRetrieval = await shouldRetrieve(state);
-  if (needsRetrieval) {
-    return 'retrieve';
-  } else {
-    return 'generate';
-  }
+  // 返回路由指令，但作为state的一部分
+  return { route: needsRetrieval ? 'retrieve' : 'generate' };
 };
 
 // 创建状态图
@@ -235,8 +230,7 @@ const workflow = new StateGraph(RAGBotAnnotation)
   .addNode('retrieve', retrieveDocuments)
   .addNode('generate', generateResponse)
   .addEdge(START, 'router')
-  .addEdge('router', 'retrieve', { condition: 'retrieve' })
-  .addEdge('router', 'generate', { condition: 'generate' })
+  .addConditionalEdges('router', (state) => state.route)
   .addEdge('retrieve', 'generate')
   .addEdge('generate', END);
 
